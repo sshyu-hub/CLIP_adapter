@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*$py.class
+
+# Model checkpoints & large artifacts
+*.pt
+*.pth
+*.ckpt
+*.pkl
+AAAsaved/
+
+# External toolkit (nested git clone)
+CLIP_Layer/baseline/MERTools/
+
+# Claude Code local settings
+.claude/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
