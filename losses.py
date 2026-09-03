@@ -1,9 +1,10 @@
 """
-Loss functions — 3-expert MoE with soft specialization.
+Loss functions — 视频级三专家 MoE 的软分工监督。
 
-E1: CE + Global Contra → general semantics (scene/object)
-E2: VA loss → face expression (valence-arousal)
-E3: HFCL → ambiguous emotions (confusable pair contrastive)
+E0 通用/布局 : 主 CE（class-weight + logit-adj，长尾修正）
+E1 唤醒/动态 : arousal 4 级 CE
+E2 细粒度/纹理: 混淆对难例对比 + Aux CE
+外加：视频级门控负载均衡 CV²（弱权重）
 """
 from __future__ import annotations
 
@@ -11,61 +12,92 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-_CONFUSABLE_GROUP_ID = {
-    "angry": 0, "worried": 0,
-    "happy": 1, "surprise": 1,
-    # sad & neutral: no confusable pair — distinct enough
-}
 
-def get_confusable_group(labels, idx_to_emotion):
-    mapping = {}
-    for i, emo in enumerate(idx_to_emotion):
-        mapping[i] = _CONFUSABLE_GROUP_ID.get(emo, -1)
-    return torch.tensor([mapping[l.item()] for l in labels], device=labels.device)
+def build_confusable_mask(labels, idx_to_emotion, confusable_pairs):
+    """构造 (B, B) 布尔矩阵，mask[i, j]=True 表示 i、j 属同一易混淆对。
+
+    覆盖 config.CONFUSABLE_PAIRS 的全部 4 对（旧版 _CONFUSABLE_GROUP_ID 只含 2 对）。
+    """
+    device = labels.device
+    B = labels.shape[0]
+    group = torch.full((len(idx_to_emotion),), -1, dtype=torch.long, device=device)
+    for gid, (a, b) in enumerate(confusable_pairs):
+        if a in idx_to_emotion:
+            group[idx_to_emotion.index(a)] = gid
+        if b in idx_to_emotion:
+            group[idx_to_emotion.index(b)] = gid
+    g = group[labels]                                    # (B,)
+    mask = (g[:, None] == g[None, :]) & (g[:, None] != -1)
+    mask = mask & ~torch.eye(B, dtype=torch.bool, device=device)
+    return mask
+
+
+def make_arousal_labels(labels, idx_to_emotion, arousal_map):
+    """把 6 类标签映射到 arousal 4 级标签。arousal_map: {emotion: level}"""
+    device = labels.device
+    out = torch.zeros_like(labels)
+    for emo, lvl in arousal_map.items():
+        if emo in idx_to_emotion:
+            out[labels == idx_to_emotion.index(emo)] = lvl
+    return out
+
+
+def make_valence_labels(labels, idx_to_emotion, valence_map):
+    """把 6 类标签映射到 valence 3 级标签。valence_map: {emotion: level}"""
+    device = labels.device
+    out = torch.zeros_like(labels)
+    for emo, lvl in valence_map.items():
+        if emo in idx_to_emotion:
+            out[labels == idx_to_emotion.index(emo)] = lvl
+    return out
 
 
 class DynamicClassBalancedCE(nn.Module):
-    def __init__(self, label_smoothing=0.1, tau=0.1):
+    """带长尾修正的 CE：可选 class-weight + logit-adjustment（先验对数加权 τ）。"""
+
+    def __init__(self, label_smoothing=0.1, tau=0.3):
         super().__init__()
         self.label_smoothing = label_smoothing
         self.tau = tau
-        self.log_prior = None
+        self.log_prior = None       # (C,) 先验对数，用于 logit-adj
+        self.class_weight = None    # (C,) 逆频率权重，用于 CE weight
 
     def set_class_counts(self, counts):
-        lp = (counts.float() / counts.float().sum()).log()
-        self._buffers.pop("log_prior", None)
-        self.__dict__.pop("log_prior", None)
-        self.register_buffer("log_prior", lp)
+        """根据训练集每类样本数计算 class-weight 与 log-prior。"""
+        counts = counts.float()
+        self.log_prior = (counts / counts.sum()).log()
+        w = counts.sum() / (counts * len(counts))
+        self.class_weight = w / w.sum() * len(counts)
 
-    def forward(self, logits, labels, epoch=None):
+    def forward(self, logits, labels):
         if self.log_prior is not None:
-            logits = logits + self.tau * self.log_prior.unsqueeze(0)
-        return F.cross_entropy(logits, labels, label_smoothing=self.label_smoothing)
+            logits = logits + self.tau * self.log_prior.to(logits.device).unsqueeze(0)
+        w = self.class_weight.to(logits.device) if self.class_weight is not None else None
+        return F.cross_entropy(logits, labels, weight=w, label_smoothing=self.label_smoothing)
 
 
 class SupervisedContrastiveLoss(nn.Module):
+    """监督对比：同类拉近，异类拉远；可选对混淆对负样本加权。"""
+
     def __init__(self, temperature=0.07):
         super().__init__()
         self.temperature = temperature
 
-    def forward(self, features, labels, confusable_groups=None):
+    def forward(self, features, labels, confusable_mask=None):
         device, B = features.device, features.shape[0]
         if B < 2:
             return torch.tensor(0.0, device=device)
         features = F.normalize(features.float(), dim=1, eps=1e-6)
         sim = torch.matmul(features, features.T) / self.temperature
         sim = sim.clamp(-10.0, 10.0)
-        pos_mask = labels.unsqueeze(0) == labels.unsqueeze(1)
-        pos_mask = pos_mask & ~torch.eye(B, dtype=torch.bool, device=device)
+        pos_mask = (labels[:, None] == labels[None, :]) & ~torch.eye(B, dtype=torch.bool, device=device)
         valid = pos_mask.any(dim=1)
         if not valid.any():
             return torch.tensor(0.0, device=device)
         all_mask = ~torch.eye(B, dtype=torch.bool, device=device)
         log_weights = torch.zeros(B, B, device=device)
-        if confusable_groups is not None:
-            neg_mask = ~(labels.unsqueeze(0) == labels.unsqueeze(1))
-            same = confusable_groups.unsqueeze(0) == confusable_groups.unsqueeze(1)
-            log_weights = torch.where(same & neg_mask, torch.tensor(0.6931, device=device), 0.0)
+        if confusable_mask is not None:
+            log_weights = torch.where(confusable_mask, torch.tensor(0.6931, device=device), 0.0)
         log_denom = torch.logsumexp(sim.masked_fill(~all_mask, float("-inf")) + log_weights, dim=1)
         pos_count = pos_mask.sum(dim=1).clamp(min=1)
         pos_sim_mean = (sim * pos_mask.float()).sum(dim=1) / pos_count
@@ -74,60 +106,28 @@ class SupervisedContrastiveLoss(nn.Module):
 
 
 class HardNegativeContrastiveLoss(nn.Module):
-    """E3: confusion-guided soft-weighted contrastive.
+    """E2 细粒度：对混淆对负样本加强排斥（hard negative boost）。"""
 
-    Uses confusion matrix to weight negatives — classes that are
-    frequently confused get stronger repulsion.
-    """
-    def __init__(self, temperature=0.07, base_boost=2.0, max_boost=8.0):
+    def __init__(self, temperature=0.07, hard_boost=4.0):
         super().__init__()
         self.temperature = temperature
-        self.base_boost = base_boost
-        self.max_boost = max_boost
-        self.confusion_matrix = None  # (C, C), updated from validation
+        self.hard_boost = hard_boost
 
-    def update_confusion(self, cm: "torch.Tensor"):
-        """Set confusion matrix from validation. cm[C, C]: cm[i,j] = #times i confused as j"""
-        self._buffers.pop("confusion_matrix", None)
-        self.__dict__.pop("confusion_matrix", None)
-        self.register_buffer("confusion_matrix", cm.float())
-
-    def forward(self, features, labels, confusable_groups=None):
+    def forward(self, features, labels, confusable_mask=None):
         device, B = features.device, features.shape[0]
         if B < 2:
             return torch.tensor(0.0, device=device)
         features = F.normalize(features.float(), dim=1, eps=1e-6)
         sim = torch.matmul(features, features.T) / self.temperature
         sim = sim.clamp(-10.0, 10.0)
-        pos_mask = labels.unsqueeze(0) == labels.unsqueeze(1)
-        pos_mask = pos_mask & ~torch.eye(B, dtype=torch.bool, device=device)
+        pos_mask = (labels[:, None] == labels[None, :]) & ~torch.eye(B, dtype=torch.bool, device=device)
         valid = pos_mask.any(dim=1)
         if not valid.any():
             return torch.tensor(0.0, device=device)
         all_mask = ~torch.eye(B, dtype=torch.bool, device=device)
-        neg_mask = ~(labels.unsqueeze(0) == labels.unsqueeze(1))
-
-        # Confusion-based or group-based weighting
         log_weights = torch.zeros(B, B, device=device)
-        if self.confusion_matrix is not None:
-            # Normalize confusion matrix per row → (C, C)
-            cm_norm = self.confusion_matrix / (self.confusion_matrix.sum(dim=1, keepdim=True) + 1e-8)
-            for i in range(B):
-                li = labels[i].item()
-                for j in range(B):
-                    if neg_mask[i, j]:
-                        lj = labels[j].item()
-                        cf = cm_norm[li, lj].item()
-                        boost = self.base_boost + cf * (self.max_boost - self.base_boost)
-                        log_weights[i, j] = torch.tensor(boost, device=device).log()
-        elif confusable_groups is not None:
-            same = confusable_groups.unsqueeze(0) == confusable_groups.unsqueeze(1)
-            hard_log = torch.tensor(self.base_boost * 2, device=device).log()
-            log_weights = torch.where(same & neg_mask, hard_log, 0.0)
-        else:
-            # Uniform: no hard negative emphasis
-            pass
-
+        if confusable_mask is not None:
+            log_weights = torch.where(confusable_mask, torch.tensor(float(self.hard_boost), device=device).log(), 0.0)
         log_denom = torch.logsumexp(sim.masked_fill(~all_mask, float("-inf")) + log_weights, dim=1)
         pos_count = pos_mask.sum(dim=1).clamp(min=1)
         pos_sim_mean = (sim * pos_mask.float()).sum(dim=1) / pos_count
@@ -135,18 +135,9 @@ class HardNegativeContrastiveLoss(nn.Module):
         return loss if not torch.isnan(loss) else torch.tensor(0.0, device=device)
 
 
-class VALoss(nn.Module):
-    def __init__(self, input_dim=1024, num_valence=3, num_arousal=2):
-        super().__init__()
-        self.valence_head = nn.Linear(input_dim, num_valence)
-        self.arousal_head = nn.Linear(input_dim, num_arousal)
-
-    def forward(self, e2_feat, valence_labels, arousal_labels):
-        return (F.cross_entropy(self.valence_head(e2_feat), valence_labels),
-                F.cross_entropy(self.arousal_head(e2_feat), arousal_labels))
-
-
 class ExpertDiversityLoss(nn.Module):
+    """专家输出正交正则（可选，防止退化）。"""
+
     def forward(self, expert_outputs):
         if expert_outputs is None:
             return torch.tensor(0.0, device="cpu")
@@ -158,83 +149,95 @@ class ExpertDiversityLoss(nn.Module):
 
 
 class CompositeLoss(nn.Module):
+    """单级 3-expert 分工监督总损失。
+
+    输入（对应 model.forward 的返回）：
+      logits          主分类 logits
+      labels          6 类标签
+      expert_features [f0, f1, f2] 各专家视频级特征
+      valence_logits  E1 valence 头（3 类）
+      arousal_logits  E1 arousal 头（4 类）
+      aux_logits      E2 Aux 头（6 类）
+    """
+
     def __init__(
-        self, num_classes=6, contrastive_temp=0.07, idx_to_emotion=None,
-        w_ce=1.0, w_contrastive=0.2, w_boundary=0.1,
-        w_fine_grained=0.1, w_expert3_aux=0.2, w_diversity=0.05, w_gate_entropy=0.005,
+        self, num_classes=6, idx_to_emotion=None, confusable_pairs=None,
+        arousal_map=None, valence_map=None, contrastive_temp=0.07,
+        w_ce=1.0, w_contrastive=0.2, w_valence=0.05, w_arousal=0.05,
+        w_hfcl=0.1, w_aux=0.2, w_div=0.05,
+        logit_adj_tau=0.1, label_smoothing=0.1,
     ):
         super().__init__()
-        self.ce_loss = DynamicClassBalancedCE()
+        self.ce_loss = DynamicClassBalancedCE(label_smoothing=label_smoothing, tau=logit_adj_tau)
         self.contrastive_loss = SupervisedContrastiveLoss(temperature=contrastive_temp)
-        self.fine_grained_loss = HardNegativeContrastiveLoss(temperature=contrastive_temp)
-        self.va_loss = VALoss()
-        self.diversity_loss = ExpertDiversityLoss()
-        self.idx_to_emotion = idx_to_emotion or ["neutral","angry","happy","sad","worried","surprise"]
+        self.hfcl_loss = HardNegativeContrastiveLoss(temperature=contrastive_temp)
+        self.div_loss = ExpertDiversityLoss()
+        self.idx_to_emotion = idx_to_emotion or ["neutral", "angry", "happy", "sad", "worried", "surprise"]
+        self.confusable_pairs = confusable_pairs or [
+            ("angry", "worried"), ("happy", "surprise"), ("sad", "worried"), ("neutral", "sad"),
+        ]
+        self.arousal_map = arousal_map or {
+            "neutral": 0, "sad": 1, "worried": 2, "angry": 3, "happy": 3, "surprise": 3,
+        }
+        self.valence_map = valence_map or {
+            "neutral": 0, "happy": 1, "surprise": 1, "angry": 2, "sad": 2, "worried": 2,
+        }
         self.w_ce = w_ce
         self.w_contrastive = w_contrastive
-        self.w_boundary = w_boundary
-        self.w_fine_grained = w_fine_grained
-        self.w_expert3_aux = w_expert3_aux
-        self.w_diversity = w_diversity
-        self.w_gate_entropy = w_gate_entropy
+        self.w_valence = w_valence
+        self.w_arousal = w_arousal
+        self.w_hfcl = w_hfcl
+        self.w_aux = w_aux
+        self.w_div = w_div
 
-    def forward(self, logits, labels, features, collected=None, fine_features=None, aux_logits=None, epoch=None):
+    def forward(self, logits, labels, expert_features=None,
+                valence_logits=None, arousal_logits=None, aux_logits=None):
         losses = {}
         total = torch.tensor(0.0, device=logits.device)
 
-        ce = self.ce_loss(logits, labels, epoch=epoch)
+        # 主 CE + Balanced Softmax
+        ce = self.ce_loss(logits, labels)
         losses["ce"] = ce
         total = total + self.w_ce * ce
 
-        confusable_groups = get_confusable_group(labels, self.idx_to_emotion)
-        contra = self.contrastive_loss(features, labels, confusable_groups)
-        losses["contrastive"] = contra
-        total = total + self.w_contrastive * contra
+        # Contra：各专家分别监督对比
+        if expert_features is not None and self.w_contrastive > 0:
+            contra = sum(self.contrastive_loss(f, labels) for f in expert_features) / len(expert_features)
+            losses["contrastive"] = contra
+            total = total + self.w_contrastive * contra
 
-        # E3 HFCL
-        if fine_features is not None:
-            fine = self.fine_grained_loss(fine_features, labels, confusable_groups)
-            losses["fine_grained"] = fine
-            total = total + self.w_fine_grained * fine
+        # VA：E1 → valence + arousal
+        if valence_logits is not None and self.w_valence > 0:
+            vl = make_valence_labels(labels, self.idx_to_emotion, self.valence_map)
+            val = F.cross_entropy(valence_logits, vl)
+            losses["valence"] = val
+            total = total + self.w_valence * val
+        if arousal_logits is not None and self.w_arousal > 0:
+            al = make_arousal_labels(labels, self.idx_to_emotion, self.arousal_map)
+            ar = F.cross_entropy(arousal_logits, al)
+            losses["arousal"] = ar
+            total = total + self.w_arousal * ar
 
-        # E3 Aux CE
-        if aux_logits is not None:
-            aux_ce = self.ce_loss(aux_logits, labels)
-            losses["expert3_aux"] = aux_ce
-            total = total + self.w_expert3_aux * aux_ce
+        # HFCL：E2（f2）混淆对 hard-negative 对比
+        if expert_features is not None and len(expert_features) >= 3 and self.w_hfcl > 0:
+            f2 = expert_features[2]
+            cmask = build_confusable_mask(labels, self.idx_to_emotion, self.confusable_pairs)
+            hfcl = self.hfcl_loss(f2, labels, cmask)
+            losses["hfcl"] = hfcl
+            total = total + self.w_hfcl * hfcl
 
-        if collected:
-            e2_feats, all_eo, all_gates = [], [], []
-            for layer_name in sorted(collected.keys(), key=int):
-                eo = collected[layer_name]["expert_outputs"]
-                g = collected[layer_name]["gates"]       # (B, E)
-                all_eo.append(eo)
-                all_gates.append(g)
-                e2_feats.append(eo[:, 1, :])
-            e2 = torch.stack(e2_feats, dim=0).mean(dim=0)
+        # Aux CE：E2
+        if aux_logits is not None and self.w_aux > 0:
+            aux = F.cross_entropy(aux_logits, labels)
+            losses["aux"] = aux
+            total = total + self.w_aux * aux
 
-            # E2 VA loss
-            valence_labels = labels.clone()
-            for emo, val in [("neutral",0),("happy",1),("surprise",1),("angry",2),("sad",2),("worried",2)]:
-                valence_labels[labels == self.idx_to_emotion.index(emo)] = val
-            arousal_labels = labels.clone()
-            for emo, ar in [("neutral",0),("sad",0),("angry",1),("happy",1),("surprise",1),("worried",1)]:
-                arousal_labels[labels == self.idx_to_emotion.index(emo)] = ar
-            v_loss, a_loss = self.va_loss(e2, valence_labels, arousal_labels)
-            losses["va"] = v_loss + a_loss
-            total = total + self.w_boundary * (v_loss + a_loss)
-
-            # Gate load balance (CV² of per-expert average weight)
-            gates = all_gates[-1]                          # (B, E) 最后一层
-            f = gates.mean(dim=0)                          # (E,) 每专家 batch 平均权重
-            cv2 = (f.std() / f.mean().clamp(min=1e-8)).pow(2)
-            losses["gate_balance"] = cv2
-            total = total + self.w_gate_entropy * cv2
-
-            # Diversity loss (专家输出正交)
-            div = self.diversity_loss(all_eo[-1])
+        # Div：专家输出正交
+        if expert_features is not None and self.w_div > 0:
+            feats = torch.stack(expert_features, dim=1)   # (B, E, D)
+            div = self.div_loss(feats)
             losses["diversity"] = div
-            total = total + self.w_diversity * div
+            total = total + self.w_div * div
 
         losses["total"] = total
         return losses

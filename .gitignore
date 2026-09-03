@@ -11,6 +11,10 @@ __pycache__/
 *.pkl
 AAAsaved/
 
+# 训练输出目录 & 指标日志
+saved*/
+*metrics.csv
+
 # External toolkit (nested git clone)
 CLIP_Layer/baseline/MERTools/
 

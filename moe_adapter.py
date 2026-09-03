@@ -88,10 +88,9 @@ class MoEAdapter(nn.Module):
             expert_outs.append(expert(x))                       # each (B, N, D)
         expert_outputs = torch.stack(expert_outs, dim=-2)       # (B, N, E, D)
 
-        adapted = (gates.unsqueeze(-1) * expert_outputs).sum(dim=-2)  # (B, N, D)
-        output = x + adapted
+        adapted = (gates.unsqueeze(-1) * expert_outputs).sum(dim=-2)  # (B, N, D) 纯增量
 
-        return output, gates, expert_outputs
+        return adapted, gates, expert_outputs
 
 
 class CLIPMoEHook(nn.Module):
@@ -121,7 +120,8 @@ class CLIPMoEHook(nn.Module):
                 "gates": gates,
                 "expert_outputs": expert_outs,
             }
-            return (adapted,) + output[1:]
+            # 残差在 hook 里做：hidden_states + Adapter(x)
+            return (hidden_states + adapted,) + output[1:]
         return hook
 
     def register(self, vision_model: nn.Module, moe_adapters: nn.ModuleDict):
