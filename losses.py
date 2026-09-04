@@ -42,16 +42,6 @@ def make_arousal_labels(labels, idx_to_emotion, arousal_map):
     return out
 
 
-def make_valence_labels(labels, idx_to_emotion, valence_map):
-    """把 6 类标签映射到 valence 3 级标签。valence_map: {emotion: level}"""
-    device = labels.device
-    out = torch.zeros_like(labels)
-    for emo, lvl in valence_map.items():
-        if emo in idx_to_emotion:
-            out[labels == idx_to_emotion.index(emo)] = lvl
-    return out
-
-
 class DynamicClassBalancedCE(nn.Module):
     """带长尾修正的 CE：可选 class-weight + logit-adjustment（先验对数加权 τ）。"""
 
@@ -74,35 +64,6 @@ class DynamicClassBalancedCE(nn.Module):
             logits = logits + self.tau * self.log_prior.to(logits.device).unsqueeze(0)
         w = self.class_weight.to(logits.device) if self.class_weight is not None else None
         return F.cross_entropy(logits, labels, weight=w, label_smoothing=self.label_smoothing)
-
-
-class SupervisedContrastiveLoss(nn.Module):
-    """监督对比：同类拉近，异类拉远；可选对混淆对负样本加权。"""
-
-    def __init__(self, temperature=0.07):
-        super().__init__()
-        self.temperature = temperature
-
-    def forward(self, features, labels, confusable_mask=None):
-        device, B = features.device, features.shape[0]
-        if B < 2:
-            return torch.tensor(0.0, device=device)
-        features = F.normalize(features.float(), dim=1, eps=1e-6)
-        sim = torch.matmul(features, features.T) / self.temperature
-        sim = sim.clamp(-10.0, 10.0)
-        pos_mask = (labels[:, None] == labels[None, :]) & ~torch.eye(B, dtype=torch.bool, device=device)
-        valid = pos_mask.any(dim=1)
-        if not valid.any():
-            return torch.tensor(0.0, device=device)
-        all_mask = ~torch.eye(B, dtype=torch.bool, device=device)
-        log_weights = torch.zeros(B, B, device=device)
-        if confusable_mask is not None:
-            log_weights = torch.where(confusable_mask, torch.tensor(0.6931, device=device), 0.0)
-        log_denom = torch.logsumexp(sim.masked_fill(~all_mask, float("-inf")) + log_weights, dim=1)
-        pos_count = pos_mask.sum(dim=1).clamp(min=1)
-        pos_sim_mean = (sim * pos_mask.float()).sum(dim=1) / pos_count
-        loss = (log_denom - pos_sim_mean)[valid].mean()
-        return loss if not torch.isnan(loss) else torch.tensor(0.0, device=device)
 
 
 class HardNegativeContrastiveLoss(nn.Module):
@@ -135,43 +96,27 @@ class HardNegativeContrastiveLoss(nn.Module):
         return loss if not torch.isnan(loss) else torch.tensor(0.0, device=device)
 
 
-class ExpertDiversityLoss(nn.Module):
-    """专家输出正交正则（可选，防止退化）。"""
-
-    def forward(self, expert_outputs):
-        if expert_outputs is None:
-            return torch.tensor(0.0, device="cpu")
-        pooled = expert_outputs.mean(dim=0)         # (E, D)
-        pooled = F.normalize(pooled, dim=1)         # (E, D)
-        sim = torch.matmul(pooled, pooled.T)        # (E, E)
-        mask = ~torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
-        return sim[mask].pow(2).mean()
-
-
 class CompositeLoss(nn.Module):
-    """单级 3-expert 分工监督总损失。
+    """视频级三专家方案的总损失。
 
     输入（对应 model.forward 的返回）：
-      logits          主分类 logits
-      labels          6 类标签
-      expert_features [f0, f1, f2] 各专家视频级特征
-      valence_logits  E1 valence 头（3 类）
-      arousal_logits  E1 arousal 头（4 类）
-      aux_logits      E2 Aux 头（6 类）
+      logits         主 logits（E0 特征融合后分类）
+      labels         6 类标签
+      fine_features  E2 专家特征 f2（混淆对对比）
+      aux_logits     E2 Aux 头 logits
+      arousal_logits E1 arousal 头 logits（4 级）
+      gates_video    (B, 3) 视频级门控（负载均衡）
     """
 
     def __init__(
         self, num_classes=6, idx_to_emotion=None, confusable_pairs=None,
-        arousal_map=None, valence_map=None, contrastive_temp=0.07,
-        w_ce=1.0, w_contrastive=0.2, w_valence=0.05, w_arousal=0.05,
-        w_hfcl=0.1, w_aux=0.2, w_div=0.05,
-        logit_adj_tau=0.1, label_smoothing=0.1,
+        arousal_map=None, contrastive_temp=0.07,
+        w_ce=1.0, w_arousal=0.3, w_fine=0.2, w_aux=0.2,
+        w_balance=0.02, logit_adj_tau=0.3, label_smoothing=0.1,
     ):
         super().__init__()
         self.ce_loss = DynamicClassBalancedCE(label_smoothing=label_smoothing, tau=logit_adj_tau)
-        self.contrastive_loss = SupervisedContrastiveLoss(temperature=contrastive_temp)
-        self.hfcl_loss = HardNegativeContrastiveLoss(temperature=contrastive_temp)
-        self.div_loss = ExpertDiversityLoss()
+        self.fine_grained_loss = HardNegativeContrastiveLoss(temperature=contrastive_temp)
         self.idx_to_emotion = idx_to_emotion or ["neutral", "angry", "happy", "sad", "worried", "surprise"]
         self.confusable_pairs = confusable_pairs or [
             ("angry", "worried"), ("happy", "surprise"), ("sad", "worried"), ("neutral", "sad"),
@@ -179,65 +124,43 @@ class CompositeLoss(nn.Module):
         self.arousal_map = arousal_map or {
             "neutral": 0, "sad": 1, "worried": 2, "angry": 3, "happy": 3, "surprise": 3,
         }
-        self.valence_map = valence_map or {
-            "neutral": 0, "happy": 1, "surprise": 1, "angry": 2, "sad": 2, "worried": 2,
-        }
         self.w_ce = w_ce
-        self.w_contrastive = w_contrastive
-        self.w_valence = w_valence
         self.w_arousal = w_arousal
-        self.w_hfcl = w_hfcl
+        self.w_fine = w_fine
         self.w_aux = w_aux
-        self.w_div = w_div
+        self.w_balance = w_balance
 
-    def forward(self, logits, labels, expert_features=None,
-                valence_logits=None, arousal_logits=None, aux_logits=None):
+    def forward(self, logits, labels, fine_features=None, aux_logits=None,
+                arousal_logits=None, gates_video=None):
         losses = {}
         total = torch.tensor(0.0, device=logits.device)
 
-        # 主 CE + Balanced Softmax
         ce = self.ce_loss(logits, labels)
         losses["ce"] = ce
         total = total + self.w_ce * ce
 
-        # Contra：各专家分别监督对比
-        if expert_features is not None and self.w_contrastive > 0:
-            contra = sum(self.contrastive_loss(f, labels) for f in expert_features) / len(expert_features)
-            losses["contrastive"] = contra
-            total = total + self.w_contrastive * contra
-
-        # VA：E1 → valence + arousal
-        if valence_logits is not None and self.w_valence > 0:
-            vl = make_valence_labels(labels, self.idx_to_emotion, self.valence_map)
-            val = F.cross_entropy(valence_logits, vl)
-            losses["valence"] = val
-            total = total + self.w_valence * val
         if arousal_logits is not None and self.w_arousal > 0:
-            al = make_arousal_labels(labels, self.idx_to_emotion, self.arousal_map)
-            ar = F.cross_entropy(arousal_logits, al)
+            ar_labels = make_arousal_labels(labels, self.idx_to_emotion, self.arousal_map)
+            ar = F.cross_entropy(arousal_logits, ar_labels)
             losses["arousal"] = ar
             total = total + self.w_arousal * ar
 
-        # HFCL：E2（f2）混淆对 hard-negative 对比
-        if expert_features is not None and len(expert_features) >= 3 and self.w_hfcl > 0:
-            f2 = expert_features[2]
+        if fine_features is not None and self.w_fine > 0:
             cmask = build_confusable_mask(labels, self.idx_to_emotion, self.confusable_pairs)
-            hfcl = self.hfcl_loss(f2, labels, cmask)
-            losses["hfcl"] = hfcl
-            total = total + self.w_hfcl * hfcl
+            fine = self.fine_grained_loss(fine_features, labels, cmask)
+            losses["fine_grained"] = fine
+            total = total + self.w_fine * fine
 
-        # Aux CE：E2
         if aux_logits is not None and self.w_aux > 0:
             aux = F.cross_entropy(aux_logits, labels)
             losses["aux"] = aux
             total = total + self.w_aux * aux
 
-        # Div：专家输出正交
-        if expert_features is not None and self.w_div > 0:
-            feats = torch.stack(expert_features, dim=1)   # (B, E, D)
-            div = self.div_loss(feats)
-            losses["diversity"] = div
-            total = total + self.w_div * div
+        if gates_video is not None and self.w_balance > 0:
+            f = gates_video.mean(dim=0)                       # (3,) 每专家 batch 平均权重
+            cv2 = (f.std() / f.mean().clamp(min=1e-8)).pow(2)
+            losses["gate_balance"] = cv2
+            total = total + self.w_balance * cv2
 
         losses["total"] = total
         return losses

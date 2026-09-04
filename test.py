@@ -2,7 +2,10 @@
 
 用法：
     python test.py                        # 用 cfg.MODEL_DIR/best_model.pt（旧路径）
-    python test.py --ckpt saved/exp_3c/best_model.pt   # 指定 checkpoint
+    python test.py --ckpt saved/exp_3c/best_model.pt   # 指定三专家方案 checkpoint
+
+会从 checkpoint 的 "arch" 字段恢复模型结构（view_decouple / fusion 等），
+保证与训练时一致；若 checkpoint 无 arch 字段（旧模型），回退到 config 默认值。
 """
 import os
 import argparse
@@ -37,12 +40,20 @@ def main():
     print(f"Loading {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
+    # 从 checkpoint 恢复架构 flag（缺省回退 config）
+    arch = ckpt.get("arch", {})
     model = CLIPMoEEmotionModel(
         clip_model_path=cfg.CLIP_MODEL_PATH, adapter_layers=cfg.ADAPTER_LAYERS,
         num_classes=num_classes, num_experts=cfg.NUM_EXPERTS,
-        adapter_bottleneck=cfg.ADAPTER_BOTTLENECK, expert_dims=cfg.EXPERT_DIMS,
-        ln_tuning_layers=cfg.LN_TUNING_LAYERS,
-        num_arousal=cfg.NUM_AROUSAL, num_valence=cfg.NUM_VALENCE,
+        adapter_bottleneck=cfg.ADAPTER_BOTTLENECK,
+        expert_dims=cfg.EXPERT_DIMS,
+        video_expert_dims=arch.get("video_expert_dims", getattr(cfg, "VIDEO_EXPERT_DIMS", [256, 128, 64])),
+        top_k=arch.get("top_k", getattr(cfg, "TOP_K", 5)),
+        fusion_feature=arch.get("fusion_feature", getattr(cfg, "FUSION_FEATURE", True)),
+        fusion_logit=arch.get("fusion_logit", getattr(cfg, "FUSION_LOGIT", True)),
+        fusion_alpha=arch.get("fusion_alpha", getattr(cfg, "FUSION_ALPHA", 0.5)),
+        num_arousal=arch.get("num_arousal", getattr(cfg, "NUM_AROUSAL", 4)),
+        view_decouple=arch.get("view_decouple", True),
     ).to(device)
     model.load_state_dict(ckpt["model"], strict=False)
     model.eval()

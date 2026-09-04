@@ -21,7 +21,7 @@ from config import EMOTION_TO_IDX, CLIP_MEAN, CLIP_STD
 DATA_ROOT = "/home/shy/emotion/MER2025_Mini"
 OPENFACE_DIR = os.path.join(DATA_ROOT, "openface_face")
 CLIP_PATH = "/home/shy/emotion/tool/transformers/clip-vit-large-patch14"
-ADAPTER_LAYERS = [13, 21, 23]
+ADAPTER_LAYERS = [19, 21, 23]
 NUM_EXPERTS = 3
 BOTTLENECK = 128
 NUM_FRAMES, IMAGE_SIZE = 16, 224
@@ -102,7 +102,7 @@ for l in ADAPTER_LAYERS:
 print(f"Adapter 可训练参数: {sum(p.numel() for p in adapters.parameters())/1e6:.3f}M")
 
 def encode(frames):
-    """frames: (B, T, C, H, W) → (B, 1024) CLS mean pool（含 MoA 增强）。"""
+    """frames: (B, T, C, H, W) → (B, 1024) CLS mean pool（含 Adapter 增强）。"""
     B, T = frames.shape[0], frames.shape[1]
     all_cls = []
     for t in range(T):
@@ -126,11 +126,12 @@ def main():
     mlp = MLP().to(device)
     optimizer = torch.optim.AdamW(list(adapters.parameters()) + list(mlp.parameters()), lr=LR, weight_decay=WD)
 
-    # metrics.csv 记录（与 base/metrics.csv 格式统一）
+    # metrics.csv 记录
     csv_file = open(os.path.join(os.path.dirname(__file__), "metrics.csv"), "w")
     csv_file.write("epoch,train_loss,val_acc,val_f1,lr\n")
 
-    best_val_f1, best_state = 0.0, None
+    best_val_f1 = 0.0
+    best_state = None
     for epoch in range(1, EPOCHS+1):
         total_loss = 0
         for frames, labels in tqdm(train_loader, desc=f"E{epoch}", leave=False):
@@ -142,7 +143,7 @@ def main():
             optimizer.step()
             total_loss += loss.item()
 
-        # 训练期间只看验证集
+        # 验证
         preds, gts = [], []
         with torch.no_grad():
             for frames, labels in val_loader:
@@ -151,16 +152,22 @@ def main():
         val_acc = accuracy_score(gts, preds)
         val_f1 = f1_score(gts, preds, average="weighted")
         avg_loss = total_loss / len(train_loader)
+
+        # 如果验证 F1 提升，保存最佳模型
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
             best_state = {k: v.cpu() for k, v in list(adapters.state_dict().items()) + list(mlp.state_dict().items())}
-        print(f"Epoch {epoch:2d}  Loss={avg_loss:.4f}  Val F1={val_f1:.4f}")
+            torch.save(best_state, os.path.join(os.path.dirname(__file__), "best_adapter.pt"))
+            print(f"Epoch {epoch:2d}  Loss={avg_loss:.4f}  Val F1={val_f1:.4f}  (新最佳，已保存)")
+        else:
+            print(f"Epoch {epoch:2d}  Loss={avg_loss:.4f}  Val F1={val_f1:.4f}")
+
         csv_file.write(f"{epoch},{avg_loss:.6f},{val_acc:.6f},{val_f1:.6f},{LR:.2e}\n")
         csv_file.flush()
 
     csv_file.close()
 
-    torch.save(best_state, os.path.join(os.path.dirname(__file__), "best_adapter.pt"))
+    # 加载最佳模型进行测试
     adapters.load_state_dict({k: v for k, v in best_state.items() if k in adapters.state_dict()}, strict=False)
     mlp.load_state_dict({k: v for k, v in best_state.items() if k in mlp.state_dict()}, strict=False)
     preds, gts = [], []

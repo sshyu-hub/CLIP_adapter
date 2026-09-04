@@ -19,6 +19,7 @@ checkpoint 格式与 test.py 兼容（存 {"model": state_dict, "epoch": ..., "v
 import os
 import sys
 import random
+import math
 import argparse
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -83,17 +84,22 @@ def main():
 
     # ── 消融开关 ──────────────────────────────────────────────
     exp = args.exp
-    use_specialize = exp in ("3b", "3c")      # Contra/VA/HFCL/Aux/Div 分工监督
-    use_longtail = exp == "3c"                # class-weight + logit-adj (BS τ)
-    print(f"specialize={use_specialize}  longtail={use_longtail}")
+    view_decouple = exp in ("3b", "3c")
+    use_specialize = exp in ("3b", "3c")      # arousal + 混淆对监督
+    use_longtail = exp == "3c"                # class-weight + logit-adj
+    fusion_feature = cfg.FUSION_FEATURE
+    fusion_logit = cfg.FUSION_LOGIT
+    print(f"view_decouple={view_decouple}  specialize={use_specialize}  longtail={use_longtail}")
 
-    # ── 模型（单级 3-expert，结构不随 exp 变）────────────────
+    # ── 模型 ──────────────────────────────────────────────────
     model = CLIPMoEEmotionModel(
         clip_model_path=cfg.CLIP_MODEL_PATH, adapter_layers=cfg.ADAPTER_LAYERS,
         num_classes=num_classes, num_experts=cfg.NUM_EXPERTS,
         adapter_bottleneck=cfg.ADAPTER_BOTTLENECK, expert_dims=cfg.EXPERT_DIMS,
-        ln_tuning_layers=cfg.LN_TUNING_LAYERS,
-        num_arousal=cfg.NUM_AROUSAL, num_valence=cfg.NUM_VALENCE,
+        video_expert_dims=cfg.VIDEO_EXPERT_DIMS, top_k=cfg.TOP_K,
+        fusion_feature=fusion_feature, fusion_logit=fusion_logit,
+        fusion_alpha=cfg.FUSION_ALPHA, num_arousal=cfg.NUM_AROUSAL,
+        view_decouple=view_decouple,
     ).to(device)
 
     # 长尾修正：计算训练集每类样本数
@@ -105,42 +111,36 @@ def main():
 
     criterion = CompositeLoss(
         num_classes=num_classes, idx_to_emotion=cfg.EMOTIONS,
-        confusable_pairs=cfg.CONFUSABLE_PAIRS,
-        arousal_map=cfg.EMOTION_AROUSAL, valence_map=cfg.EMOTION_VALENCE,
+        confusable_pairs=cfg.CONFUSABLE_PAIRS, arousal_map=cfg.EMOTION_AROUSAL,
         contrastive_temp=cfg.CONTRASTIVE_TEMP,
-        w_ce=cfg.LOSS_WEIGHT_CE,
-        w_contrastive=cfg.LOSS_WEIGHT_CONTRASTIVE if use_specialize else 0.0,
-        w_valence=cfg.LOSS_WEIGHT_VA / 2 if use_specialize else 0.0,
-        w_arousal=cfg.LOSS_WEIGHT_VA / 2 if use_specialize else 0.0,
-        w_hfcl=cfg.LOSS_WEIGHT_HFCL if use_specialize else 0.0,
-        w_aux=cfg.LOSS_WEIGHT_AUX if use_specialize else 0.0,
-        w_div=cfg.LOSS_WEIGHT_DIVERSITY if use_specialize else 0.0,
+        w_ce=cfg.LOSS_WEIGHT_CE, w_arousal=cfg.LOSS_WEIGHT_AROUSAL if use_specialize else 0.0,
+        w_fine=cfg.LOSS_WEIGHT_FINE_GRAINED if use_specialize else 0.0,
+        w_aux=cfg.LOSS_WEIGHT_EXPERT3_AUX if use_specialize else 0.0,
+        w_balance=cfg.LOSS_WEIGHT_GATE_ENTROPY,
         logit_adj_tau=cfg.LOGIT_ADJ_TAU if use_longtail else 0.0,
     )
     if use_longtail:
         criterion.ce_loss.set_class_counts(class_counts)
 
-    # 可训练参数分组：LN tuning 用 LN_LR，其余（MoE/门控/分类头）用主 lr
-    ln_params, other_params = [], []
-    for n, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if "vision_model.encoder.layers" in n and "layer_norm" in n:
-            ln_params.append(p)
-        else:
-            other_params.append(p)
-    n_params = sum(p.numel() for p in ln_params + other_params)
-    print(f"Trainable params: {n_params/1e6:.3f}M (LN tuning: {sum(p.numel() for p in ln_params)/1e6:.3f}M)")
-    optimizer = torch.optim.AdamW([
-        {"params": ln_params, "lr": cfg.LN_LR},
-        {"params": other_params, "lr": args.lr},
-    ], weight_decay=cfg.WEIGHT_DECAY)
+    # 可训练参数：MoEAdapter + 视频级专家 + 门控 + 分类头
+    params = [p for p in model.parameters() if p.requires_grad]
+    n_params = sum(p.numel() for p in params)
+    print(f"Trainable params: {n_params/1e6:.3f}M")
+    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=cfg.WEIGHT_DECAY)
+
+    # ── 学习率调度：warmup + cosine（对齐 config.WARMUP_EPOCHS / LR_SCHEDULER）──
+    def get_lr(epoch):
+        # epoch 为 1-indexed；warmup 阶段线性爬升，之后 cosine 衰减到 0
+        if epoch <= cfg.WARMUP_EPOCHS:
+            return args.lr * epoch / cfg.WARMUP_EPOCHS
+        progress = (epoch - cfg.WARMUP_EPOCHS) / max(1, args.epochs - cfg.WARMUP_EPOCHS)
+        return args.lr * 0.5 * (1 + math.cos(math.pi * progress))
 
     # ── 保存目录 ──────────────────────────────────────────────
     save_dir = os.path.join(cfg.SAVE_DIR, f"exp_{exp}")
     os.makedirs(save_dir, exist_ok=True)
     csv_file = open(os.path.join(save_dir, "metrics.csv"), "w")
-    csv_file.write("epoch,train_loss,val_acc,val_f1,test_acc,test_f1\n")
+    csv_file.write("epoch,train_loss,val_acc,val_f1,test_acc,test_f1,lr\n")
 
     @torch.no_grad()
     def evaluate(loader):
@@ -156,6 +156,9 @@ def main():
 
     best_val_f1, best_state = 0.0, None
     for epoch in range(1, args.epochs + 1):
+        lr = get_lr(epoch)
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr
         model.train()
         total_loss = 0.0
         for batch in tqdm(train_loader, desc=f"E{epoch}", leave=False):
@@ -165,10 +168,10 @@ def main():
             out = model(frames)
             losses = criterion(
                 out["logits"], labels,
-                expert_features=out["expert_features"],
-                valence_logits=out["valence_logits"],
-                arousal_logits=out["arousal_logits"],
+                fine_features=out["fine_features"],
                 aux_logits=out["aux_logits"],
+                arousal_logits=out["arousal_logits"],
+                gates_video=out["gates_video"],
             )
             loss = losses["total"]
 
@@ -181,8 +184,8 @@ def main():
         val_acc, val_f1 = evaluate(val_loader)
         test_acc, test_f1 = evaluate(test_loader)
         avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch:2d}  Loss={avg_loss:.4f}  Val F1={val_f1:.4f}  Test F1={test_f1:.4f}")
-        csv_file.write(f"{epoch},{avg_loss:.6f},{val_acc:.6f},{val_f1:.6f},{test_acc:.6f},{test_f1:.6f}\n")
+        print(f"Epoch {epoch:2d}  Loss={avg_loss:.4f}  Val F1={val_f1:.4f}  Test F1={test_f1:.4f}  LR={lr:.2e}")
+        csv_file.write(f"{epoch},{avg_loss:.6f},{val_acc:.6f},{val_f1:.6f},{test_acc:.6f},{test_f1:.6f},{lr:.6e}\n")
         csv_file.flush()
 
         if val_f1 > best_val_f1:
@@ -190,6 +193,16 @@ def main():
             best_state = {
                 "model": {k: v.cpu() for k, v in model.state_dict().items()},
                 "epoch": epoch, "val_f1": val_f1,
+                # 架构 flag：推理时据此重建模型，避免训练/推理结构不一致
+                "arch": {
+                    "video_expert_dims": cfg.VIDEO_EXPERT_DIMS,
+                    "top_k": cfg.TOP_K,
+                    "fusion_feature": fusion_feature,
+                    "fusion_logit": fusion_logit,
+                    "fusion_alpha": cfg.FUSION_ALPHA,
+                    "num_arousal": cfg.NUM_AROUSAL,
+                    "view_decouple": view_decouple,
+                },
             }
 
     csv_file.close()

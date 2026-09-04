@@ -1,23 +1,14 @@
 """
-CLIP-Large + MLP 基线（无 Adapter，多种子取平均）。
+CLIP-Large + MLP 基线（无 Adapter）
 完全复用第一份 Adapter 代码的数据加载和特征提取方式。
-
-与旧版 base_simple.py 的区别：
-  - 多种子重复训练（默认 6），每个 seed 固定随机性（初始化 + batch 顺序）
-  - 每个 seed 得到 test acc/f1，最终输出 mean ± std
-  - 结果写入 metrics.csv（seed,test_acc,test_f1，末尾加 mean/std 汇总行）
-
-用法:
-  python base_simple.py             # 默认 6 个 seed
-  python base_simple.py --seeds 10
 """
-import os, sys, random, argparse
+import os, sys, random
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import numpy as np
 import torch, torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, classification_report
 from tqdm import tqdm
 from transformers import CLIPModel
 
@@ -33,7 +24,6 @@ BATCH_SIZE = 8
 EPOCHS = 10
 LR = 1e-3
 WD = 1e-4
-N_SEEDS = 6
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"设备: {device}")
 
@@ -72,22 +62,12 @@ class FDataset(Dataset):
         frames = (frames - m) / s
         return frames, self.labels.get(name, -1)
 
-# ── 构建 CLIP 视觉编码器（冻结，全局共享）───────────────────
+# ── 构建 CLIP 视觉编码器（冻结）───────────────────────────────
 clip = CLIPModel.from_pretrained(CLIP_PATH, local_files_only=True).to(device)
 vision = clip.vision_model
 for p in vision.parameters():
     p.requires_grad = False
 vision.eval()
-
-def encode(frames):
-    """frames: (B, T, C, H, W) → (B, 1024) CLS mean pool。"""
-    B, T = frames.shape[0], frames.shape[1]
-    all_cls = []
-    with torch.no_grad():
-        for t in range(T):
-            out = vision(pixel_values=frames[:, t])
-            all_cls.append(out.last_hidden_state[:, 0, :])  # (B, 1024)
-    return torch.stack(all_cls, dim=1).mean(dim=1)           # (B, 1024)
 
 # ── MLP 分类头 ──────────────────────────────────────────────
 class MLP(nn.Module):
@@ -100,44 +80,51 @@ class MLP(nn.Module):
         x = self.relu(self.fc1(x))
         return self.fc2(x)
 
-# ── 随机性控制 ──────────────────────────────────────────────
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+def encode(frames):
+    """frames: (B, T, C, H, W) → (B, 1024) CLS token mean pool。"""
+    B, T = frames.shape[0], frames.shape[1]
+    all_cls = []
+    for t in range(T):
+        out = vision(pixel_values=frames[:, t])
+        all_cls.append(out.last_hidden_state[:, 0, :])  # (B, 1024)
+    return torch.stack(all_cls, dim=1).mean(dim=1)       # (B, 1024)
 
-def seed_worker(worker_id):
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
+# ── 主函数 ──────────────────────────────────────────────────
+def main():
+    tr_names, tr_labels, te_names, te_labels = load_data()
+    print(f"训练样本: {len(tr_names)}, 测试样本: {len(te_names)}")
 
-# ── 单个 seed 的完整训练 + 测试 ─────────────────────────────
-def run_one_seed(seed, tr_names_train, tr_names_val, tr_labels, te_names, te_labels):
-    set_seed(seed)
+    # 固定划分 90% 训练，10% 验证
+    random.seed(42)
+    random.shuffle(tr_names)
+    split = int(0.9 * len(tr_names))
+    tr_names_train = tr_names[:split]
+    tr_names_val = tr_names[split:]
 
-    g = torch.Generator()
-    g.manual_seed(seed)
-    train_loader = DataLoader(FDataset(tr_names_train, tr_labels), batch_size=BATCH_SIZE,
-                              shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
-                              worker_init_fn=seed_worker, generator=g)
-    val_loader = DataLoader(FDataset(tr_names_val, tr_labels), batch_size=BATCH_SIZE*2,
-                            shuffle=False, num_workers=2, pin_memory=True)
-    test_loader = DataLoader(FDataset(te_names, te_labels), batch_size=BATCH_SIZE*2,
-                             shuffle=False, num_workers=2, pin_memory=True)
+    train_ds = FDataset(tr_names_train, tr_labels)
+    val_ds = FDataset(tr_names_val, tr_labels)
+    test_ds = FDataset(te_names, te_labels)
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE*2, shuffle=False, num_workers=2, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE*2, shuffle=False, num_workers=2, pin_memory=True)
 
     model = MLP().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
 
-    best_val_f1, best_state = 0.0, None
+    best_val_f1 = 0.0
     for epoch in range(1, EPOCHS+1):
         model.train()
         total_loss = 0
-        for frames, labels in tqdm(train_loader, desc=f"seed{seed} E{epoch}", leave=False):
+        for frames, labels in tqdm(train_loader, desc=f"Epoch {epoch}", leave=False):
             frames, labels = frames.to(device), labels.to(device)
-            cls = encode(frames)
-            loss = F.cross_entropy(model(cls), labels)
-            optimizer.zero_grad(); loss.backward(); optimizer.step()
+            with torch.no_grad():
+                cls = encode(frames)
+            logits = model(cls)
+            loss = F.cross_entropy(logits, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
             total_loss += loss.item()
 
         # 验证
@@ -145,67 +132,34 @@ def run_one_seed(seed, tr_names_train, tr_names_val, tr_labels, te_names, te_lab
         preds, gts = [], []
         with torch.no_grad():
             for frames, labels in val_loader:
-                preds.extend(model(encode(frames.to(device))).argmax(-1).cpu().numpy())
+                frames = frames.to(device)
+                cls = encode(frames)
+                logits = model(cls)
+                preds.extend(logits.argmax(-1).cpu().numpy())
                 gts.extend(labels.numpy())
         val_f1 = f1_score(gts, preds, average="weighted")
+        print(f"Epoch {epoch:2d}  Loss={total_loss/len(train_loader):.4f}  Val F1={val_f1:.4f}")
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
-            best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+            torch.save(model.state_dict(), os.path.join(os.path.dirname(__file__), "best_mlp.pt"))
 
-    # 用最佳模型测试
-    model.load_state_dict(best_state)
+    # 加载最佳模型测试
+    model.load_state_dict(torch.load(os.path.join(os.path.dirname(__file__), "best_mlp.pt")))
     model.eval()
     preds, gts = [], []
     with torch.no_grad():
         for frames, labels in test_loader:
-            preds.extend(model(encode(frames.to(device))).argmax(-1).cpu().numpy())
+            frames = frames.to(device)
+            cls = encode(frames)
+            logits = model(cls)
+            preds.extend(logits.argmax(-1).cpu().numpy())
             gts.extend(labels.numpy())
     test_acc = accuracy_score(gts, preds)
     test_f1 = f1_score(gts, preds, average="weighted")
-    torch.save(best_state, os.path.join(os.path.dirname(__file__), f"best_mlp_s{seed}.pt"))
-    return test_acc, test_f1
-
-# ── 主函数 ──────────────────────────────────────────────────
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--seeds", type=int, default=N_SEEDS)
-    args = parser.parse_args()
-    seeds = range(args.seeds)
-
-    tr_names, tr_labels, te_names, te_labels = load_data()
-    print(f"训练样本: {len(tr_names)}, 测试样本: {len(te_names)}")
-
-    # 固定划分 90% 训练，10% 验证（与 seed 无关）
-    random.seed(42)
-    random.shuffle(tr_names)
-    split = int(0.9 * len(tr_names))
-    tr_names_train = tr_names[:split]
-    tr_names_val = tr_names[split:]
-
-    rows = []
-    for seed in seeds:
-        acc, f1 = run_one_seed(seed, tr_names_train, tr_names_val, tr_labels, te_names, te_labels)
-        rows.append((seed, acc, f1))
-        print(f"seed {seed}: Test Acc = {acc:.4f}   Test F1 = {f1:.4f}")
-
-    accs = [r[1] for r in rows]
-    f1s = [r[2] for r in rows]
-    mean_acc, std_acc = float(np.mean(accs)), float(np.std(accs))
-    mean_f1, std_f1 = float(np.mean(f1s)), float(np.std(f1s))
-
-    # 写 metrics.csv
-    csv_path = os.path.join(os.path.dirname(__file__), "metrics.csv")
-    with open(csv_path, "w") as f:
-        f.write("seed,test_acc,test_f1\n")
-        for seed, acc, f1 in rows:
-            f.write(f"{seed},{acc:.6f},{f1:.6f}\n")
-        f.write(f"mean,{mean_acc:.6f},{mean_f1:.6f}\n")
-        f.write(f"std,{std_acc:.6f},{std_f1:.6f}\n")
-
     print(f"\n{'='*60}")
-    print(f"Test Acc = {mean_acc:.4f}±{std_acc:.4f}   Test F1 = {mean_f1:.4f}±{std_f1:.4f}  (n={len(rows)})")
-    print(f"结果已写入 {csv_path}")
+    print(f"Test Acc = {test_acc:.4f}   Test F1 = {test_f1:.4f}")
     print(f"{'='*60}")
+    print(classification_report(gts, preds, target_names=["neutral","angry","happy","sad","worried","surprise"]))
 
 if __name__ == "__main__":
     main()

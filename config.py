@@ -22,21 +22,28 @@ CLIP_HIDDEN_DIM = 1024
 CLIP_INTERMEDIATE_DIM = 4096
 CLIP_NUM_LAYERS = 24
 
-# MoE Adapter 注入层（0-indexed，第 13/21/23 层后）
+# MoE Adapter insertion points (1-indexed layer numbers: 12, 18, 24)
+# CLIP ViT-L/14 has 24 layers, 0-indexed: [11, 17, 23]
 ADAPTER_LAYERS = [13, 21, 23]
 
-# 每层专家数（单级 3-expert：E0 通用 / E1 VA / E2 细粒度）
-NUM_EXPERTS = 3
+# Number of experts per adapter (per-token MoE: 通用 + VA)
+NUM_EXPERTS = 2
 
 # Expert bottleneck hidden dim
 ADAPTER_BOTTLENECK = CLIP_HIDDEN_DIM // 8  # 128
-# 每专家 bottleneck（统一 128）
-EXPERT_DIMS = [128, 128, 128]
+# Per-expert bottleneck dims: [E0=通用, E1=VA]
+EXPERT_DIMS = [256, 128]
 
-# ── LN tuning ────────────────────────────────────────────────
-# 解冻指定层 LayerNorm 做 tuning（lr 单独设，见 LN_LR）
-LN_TUNING_LAYERS = [13, 21, 23]   # 与 ADAPTER_LAYERS 一致
-LN_LR = 1e-5
+# ── 视频级三专家（新方案，作用于 last_hidden_state）────────────────
+# E0 通用/布局 + E1 唤醒/动态 + E2 细粒度/纹理，瓶颈递减 256/128/64
+VIDEO_EXPERT_DIMS = [256, 128, 64]
+# E2 细粒度专家：时间维度 top-k mean（取特征范数最强的 k 帧）
+TOP_K = 5
+# 门控融合：特征融合 + logit 融合（否则 aux 损失无法进入最终预测）
+FUSION_FEATURE = True
+FUSION_LOGIT = True
+# 专家集成在最终 logits 上的权重
+FUSION_ALPHA = 0.5
 
 # ── Emotion Classes ────────────────────────────────────────────────
 EMOTIONS = ["neutral", "angry", "happy", "sad", "worried", "surprise"]
@@ -45,7 +52,9 @@ NUM_CLASSES = len(EMOTIONS)
 # Emotion → index mapping
 EMOTION_TO_IDX = {e: i for i, e in enumerate(EMOTIONS)}
 
-# E1 唤醒/动态专家监督：arousal 4 级单调强度
+# Arousal grouping for video-level Expert E1 (唤醒/动态专家) — 4 级单调强度
+# 替换原 3 级 valence：neutral=0 / sad=1 / worried=2 / angry·happy·surprise=3
+# 同时解 layer1（neutral vs rest）+ layer2（sad/worried/angry 按强度分开）
 EMOTION_AROUSAL = {
     "neutral": 0,
     "sad": 1,
@@ -55,17 +64,6 @@ EMOTION_AROUSAL = {
     "surprise": 3,
 }
 NUM_AROUSAL = 4
-
-# E1 VA 监督：valence 3 级（neutral / positive / negative）
-EMOTION_VALENCE = {
-    "neutral": 0,    # neutral
-    "happy": 1,      # positive
-    "surprise": 1,   # positive
-    "angry": 2,      # negative
-    "sad": 2,        # negative
-    "worried": 2,    # negative
-}
-NUM_VALENCE = 3  # neutral / positive / negative
 
 # Confusable emotion pairs for fine-grained expert contrastive learning
 CONFUSABLE_PAIRS = [
@@ -93,18 +91,15 @@ WEIGHT_DECAY = 1e-4
 WARMUP_EPOCHS = 3
 LR_SCHEDULER = "cosine"
 
-# Loss weights（单级 3-expert 分工监督）
-LOSS_WEIGHT_CE = 1.0           # 主 CE + Balanced Softmax(τ)
-LOSS_WEIGHT_CONTRASTIVE = 0.2  # 各专家分别监督对比
-LOSS_WEIGHT_VA = 0.1           # E1 valence(3)+arousal(4)，各 0.05
-LOSS_WEIGHT_HFCL = 0.1         # E2 混淆对 hard-negative 对比
-LOSS_WEIGHT_AUX = 0.2          # E2 Aux CE
-LOSS_WEIGHT_DIVERSITY = 0.05   # 专家输出正交正则
+# Loss weights（对齐新三专家方案）
+LOSS_WEIGHT_CE = 1.0
+LOSS_WEIGHT_AROUSAL = 0.3      # E1 arousal 4 级
+LOSS_WEIGHT_FINE_GRAINED = 0.2  # E2 混淆对对比
+LOSS_WEIGHT_EXPERT3_AUX = 0.2   # E2 Aux CE
+LOSS_WEIGHT_GATE_ENTROPY = 0.02  # 负载均衡 CV²（异构专家弱均衡，原 0.1）
 
-# 长尾修正：主 CE 的 logit-adjustment 强度（Balanced Softmax τ）
-LOGIT_ADJ_TAU = 0.1
-
-MIXUP_ALPHA = 0.4
+# 长尾修正：主 CE 的 logit-adjustment 强度（先验对数加权）
+LOGIT_ADJ_TAU = 0.3
 
 # Contrastive loss temperature
 CONTRASTIVE_TEMP = 0.07
